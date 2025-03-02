@@ -1,0 +1,178 @@
+import requests
+from web3 import Web3
+from datetime import datetime
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+
+# Set network (testnet or mainnet)
+NETWORK = "testnet"  # Change to "mainnet" for production
+
+# Alchemy RPC URLs
+ALCHEMY_BASE_URLS = {
+    "testnet": "https://opt-sepolia.g.alchemy.com/v2",
+    "mainnet": "https://opt-mainnet.g.alchemy.com/v2"
+}
+YOUR_API_KEY = "YOUR_API_KEY"  # Replace with your actual API key
+OPTIMISM_RPC_URL = f"{ALCHEMY_BASE_URLS[NETWORK]}/{YOUR_API_KEY}"
+
+# Balancer Subgraph URL (testnet or mainnet)
+SUBGRAPH_URLS = {
+    "testnet": "https://api.thegraph.com/subgraphs/name/balancer-labs/balancer-optimism-sepolia",  # Update if available
+    "mainnet": "https://api.thegraph.com/subgraphs/name/balancer-labs/balancer-optimism"
+}
+SUBGRAPH_URL = SUBGRAPH_URLS[NETWORK]
+
+# Minimum profit threshold (0.2%)
+MIN_PROFIT_THRESHOLD = 0.002
+
+# Gas cost per swap (in ETH)
+GAS_PER_SWAP = 0.0001  # Placeholder, will be updated with real-time gas price
+ETH_PRICE = 1600  # Placeholder, will be updated with real-time ETH price
+
+# Function to fetch real-time ETH price from CoinGecko
+def fetch_eth_price():
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {
+        "ids": "ethereum",
+        "vs_currencies": "usd"
+    }
+    response = requests.get(url, params=params)
+    if response.status_code == 200:
+        return response.json()['ethereum']['usd']
+    else:
+        print("Error fetching ETH price:", response.status_code)
+        return 1600  # Fallback price
+
+# Function to fetch real-time gas price on Optimism
+def fetch_optimism_gas_price():
+    url = "https://api.optimism.io/api/v1/gas-price"
+    response = requests.get(url)
+    if response.status_code == 200:
+        return float(response.json()['gasPrice']) / 1e9  # Convert from wei to Gwei
+    else:
+        print("Error fetching Optimism gas price:", response.status_code)
+        return 0.001  # Fallback gas price in Gwei
+
+# Function to fetch pool data from Balancer Subgraph
+def fetch_pools():
+    query = """
+    {
+      pools(
+        first: 1000,
+        where: {
+          totalLiquidity_gt: 5000,
+          swapFee_gt: 0.000001,
+          swapFee_lt: 0.001
+        }
+      ) {
+        id
+        tokens {
+          symbol
+          address
+          balance
+        }
+        swapFee
+        totalLiquidity
+      }
+    }
+    """
+    response = requests.post(SUBGRAPH_URL, json={'query': query})
+    if response.status_code == 200:
+        pools = response.json()['data']['pools']
+        # Extract all unique tokens from the pools
+        tokens = set()
+        for pool in pools:
+            for token in pool['tokens']:
+                tokens.add(token['symbol'])
+        print(f"Found {len(tokens)} tokens in pools: {tokens}")
+        return pools
+    else:
+        print("Error fetching pool data:", response.status_code)
+        return []
+
+# Function to calculate the output amount for a swap
+def calculate_output_amount(input_amount, input_balance, output_balance, swap_fee):
+    fee_factor = 1 - swap_fee
+    return (input_amount * output_balance * fee_factor) / (input_balance + input_amount * fee_factor)
+
+# Function to calculate net profit after gas costs
+def calculate_net_profit(profit, steps):
+    total_gas_cost = GAS_PER_SWAP * steps * ETH_PRICE
+    return profit - total_gas_cost
+
+# Function to build a graph representation of pools and tokens
+def build_graph(pools):
+    graph = defaultdict(list)
+    for pool in pools:
+        tokens = [token['address'] for token in pool['tokens']]
+        for i in range(len(tokens)):
+            for j in range(len(tokens)):
+                if i != j:
+                    graph[tokens[i]].append((tokens[j], pool['id'], pool['swapFee']))
+    return graph
+
+# Function to find arbitrage opportunities
+def find_arbitrage_opportunities(pools):
+    opportunities = []
+    graph = build_graph(pools)
+
+    def search_path(start_token, path, current_amount):
+        if len(path) > 4:  # Limit to 4-step arbitrage
+            return
+        for neighbor, pool_id, swap_fee in graph[path[-1]]:
+            if neighbor == start_token and len(path) > 1:
+                # Calculate profit
+                profit = current_amount - 1
+                net_profit = calculate_net_profit(profit, len(path))
+                if net_profit >= MIN_PROFIT_THRESHOLD:
+                    opportunities.append({
+                        "path": [token_data[token]['symbol'] for token in path + [neighbor]],
+                        "profit": net_profit,
+                        "steps": len(path)
+                    })
+            elif neighbor not in path:
+                # Simulate the swap
+                input_balance = token_data[path[-1]]['balance']
+                output_balance = token_data[neighbor]['balance']
+                new_amount = calculate_output_amount(current_amount, input_balance, output_balance, swap_fee)
+                search_path(start_token, path + [neighbor], new_amount)
+
+    with ThreadPoolExecutor() as executor:
+        for token in graph:
+            executor.submit(search_path, token, [token], 1)
+
+    return opportunities
+
+# Function to save results to a text file
+def save_results(opportunities):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"arbitrage_opportunities_{timestamp}.txt"
+    with open(filename, "w") as file:
+        for opp in opportunities:
+            file.write(f"Arbitrage Path: {' -> '.join(opp['path'])}\n")
+            file.write(f"Steps: {opp['steps']}\n")
+            file.write(f"Profit: {opp['profit'] * 100:.2f}%\n")
+            file.write("-" * 40 + "\n")
+    print(f"Results saved to {filename}")
+
+# Main function
+def main():
+    global ETH_PRICE, GAS_PER_SWAP
+    ETH_PRICE = fetch_eth_price()
+    GAS_PER_SWAP = fetch_optimism_gas_price() * 1e-9  # Convert Gwei to ETH
+
+    print("Fetching pool data...")
+    pools = fetch_pools()
+    print(f"Found {len(pools)} pools with TVL >= $5,000 and swap fees between 0.0001% and 0.1%.")
+
+    print("Calculating arbitrage opportunities...")
+    opportunities = find_arbitrage_opportunities(pools)
+    print(f"Found {len(opportunities)} arbitrage opportunities with profit >= 0.2%.")
+
+    if opportunities:
+        save_results(opportunities)
+    else:
+        print("No arbitrage opportunities found.")
+
+if __name__ == "__main__":
+    main()
